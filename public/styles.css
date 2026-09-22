@@ -621,3 +621,96 @@ textarea { width: 100%; resize: vertical; font-family: inherit; }
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.err { background: var(--danger); }
+
+/* ================= 条款沿革 ================= */
+.lineage-panel {
+  margin: 6px 0 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.lineage-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0 4px;
+}
+.lineage-form label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dim); }
+.lineage-form select { max-width: 360px; padding: 6px 8px; font-size: 13px; }
+.lineage-preview {
+  margin: 8px 0;
+  font-size: 13px;
+}
+.lineage-tree-box { margin-top: 10px; }
+.lineage-start {
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--primary);
+  background: #fff;
+  border-radius: 6px;
+}
+.lineage-text {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+}
+.lineage-text.is-start { border-color: #bfdbfe; background: #eff6ff; }
+
+.tree-node {
+  position: relative;
+  margin: 6px 0 6px 18px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--border);
+  background: #fff;
+  border-radius: 6px;
+}
+.tree-node.lg-unchanged { border-left-color: var(--added-fg); }
+.tree-node.lg-modified { border-left-color: var(--changed-fg); }
+.tree-node.lg-replaced { border-left-color: #7c3aed; }
+.tree-node.lg-deleted { border-left-color: var(--removed-fg); }
+.tree-node.is-deletion { background: var(--removed-bg); }
+.tree-node-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 14px;
+}
+.tree-caret {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--dim);
+  padding: 0 2px;
+}
+.tree-caret.leaf { color: #cbd5e1; cursor: default; }
+.tree-edge-meta { margin: 2px 0 0 28px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 10px; }
+.tree-children { margin-top: 4px; }
+.tree-children[hidden] { display: none; }
+.lineage-terminal {
+  font-size: 12px;
+  color: var(--removed-fg);
+  background: #fff1f2;
+  border: 1px solid var(--removed-border);
+  border-radius: 999px;
+  padding: 1px 10px;
+}
+
+/* 沿革关系徽标 */
+.badge.lg-unchanged { color: var(--added-fg); background: var(--added-bg); }
+.badge.lg-modified { color: var(--changed-fg); background: var(--changed-bg); }
+.badge.lg-replaced { color: #6d28d9; background: #f5f3ff; }
+.badge.lg-deleted { color: var(--removed-fg); background: var(--removed-bg); }
+.chip.lg-unchanged { color: var(--added-fg); }
+.chip.lg-modified { color: var(--changed-fg); }
+.chip.lg-replaced { color: #6d28d9; }
+.chip.lg-deleted { color: var(--removed-fg); }

@@ -46,10 +46,32 @@ const V3 = `第一条 为规范平台数据处理活动，保障数据安全，�
 
 第八条 平台应当每年开展数据安全评估，并将评估结果报送主管部门。`;
 
+/**
+ * 分叉版本 v2.1：以 v2（送审稿）为基线，演示 versions.baseline_id 形成的分支图——
+ * 条款沿革从任一段落出发可同时看到 v3 主线与 v2.1 分支的不同去向。
+ * 相对 v2：第三条未变；第六条罚时限仍为二十四小时（未变）；新增「数据出境」专条；
+ * 第七条罚款段被新条新增替代；第八条年度评估在本分支被删除。
+ */
+const V2_BRANCH = `第一条 为规范平台数据处理活动，保障数据安全，根据《中华人民共和国数据安全法》等法律法规，制定本办法。
+
+第二条 本办法适用于在境内开展的平台数据收集、存储、使用、加工、传输、提供、公开等活动。
+
+第三条 平台运营者应当建立数据安全管理制度，明确数据安全负责人，落实数据安全保护责任。
+
+第四条 平台收集个人信息，应当遵循合法、正当、必要的原则，公开收集规则，明示收集目的、方式和范围，不得过度收集与提供服务无关的个人信息。
+
+第五条 平台应当对用户数据实行分类分级管理，采取相应的技术保护措施，防止数据泄露、篡改、丢失。
+
+第六条 平台发生数据安全事件，应当在二十四小时内向主管部门报告，并同步采取补救措施。
+
+第七条 平台开展数据出境活动，应当通过国家网信部门组织的安全评估，并与境外接收方订立标准合同后方可向境外提供数据。`;
+
 export interface DemoResult {
   projectId: number;
   projectName: string;
   comparisons: number[];
+  /** 主线第二轮比对 id（v2→v3），演示入口默认跳转到这里 */
+  mainComparisonId: number;
   migration: unknown;
 }
 
@@ -97,10 +119,17 @@ export function seedDemo(db: DB): DemoResult {
   // 为本轮比对预置审阅分派：登记名单、分派片段，并演示认领 / 完成 / 待认领三种状态
   seedAssignments(db, r3.comparisonId);
 
+  // 分叉版本：以 v2 送审稿为基线（而非最新的 v3），形成版本分支图，供「条款沿革」演示
+  const rBranch = importVersion(db, projectId, 'v2.1 出境专章（基于送审稿分叉）', V2_BRANCH, r2.versionId);
+  if (rBranch.status !== 'ok' || rBranch.comparisonId == null) {
+    throw new Error('示例数据异常：分叉版本比对未生成');
+  }
+
   return {
     projectId,
     projectName,
-    comparisons: [r2.comparisonId, r3.comparisonId],
+    comparisons: [r2.comparisonId, r3.comparisonId, rBranch.comparisonId],
+    mainComparisonId: r3.comparisonId,
     migration: r3.migration,
   };
 }

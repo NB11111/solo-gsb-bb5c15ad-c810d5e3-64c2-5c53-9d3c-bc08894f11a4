@@ -21,6 +21,7 @@ import {
 import { toCsv, toMarkdown } from './exporter';
 import { buildResolution, resolutionToMarkdown } from './resolution';
 import { seedDemo } from './demo';
+import { traceLineage, getVersionParagraphs } from './lineage';
 import {
   addReviewer,
   removeReviewer,
@@ -118,6 +119,44 @@ app.post('/api/projects/:id/versions', (req, res) => {
     return badRequest(res, '比对基线必须早于本次导入的新版本');
   }
   res.status(201).json(result);
+});
+
+// ---------- 条款沿革 ----------
+/** 取项目内某版本切分后的段落列表（供「条款沿革」选择追踪起点段落，重复文本按段落序号消歧） */
+app.get('/api/projects/:id/versions/:vid/paragraphs', (req, res) => {
+  const projectId = Number(req.params.id);
+  const versionId = Number(req.params.vid);
+  if (!Number.isInteger(versionId) || versionId <= 0) return notFound(res, '版本不存在');
+  const data = getVersionParagraphs(db, projectId, versionId);
+  if (!data) return notFound(res, '版本不存在或不属于该项目');
+  res.json(data);
+});
+
+/**
+ * 条款沿革：从「某版本 · 某段落」出发，沿 versions.baseline_id 构成的分支图
+ * 追踪其在后续各版本中的未变 / 修改 / 删除 / 新增替代关系（按段落位置消歧）。
+ * 未知版本或段落返回 404；跨项目数据不进入结果。
+ */
+app.get('/api/projects/:id/lineage', (req, res) => {
+  const projectId = Number(req.params.id);
+  const versionId = Number(req.query.version_id);
+  const paragraph = Number(req.query.paragraph);
+  if (!Number.isInteger(versionId) || versionId <= 0) {
+    return badRequest(res, 'version_id 必须为正整数');
+  }
+  if (!Number.isInteger(paragraph) || paragraph <= 0) {
+    return badRequest(res, 'paragraph 必须为正整数（1 起始的段落序号）');
+  }
+  const result = traceLineage(db, projectId, versionId, paragraph);
+  if (result.status === 'project_not_found') return notFound(res, '项目不存在');
+  if (result.status === 'version_not_found') return notFound(res, '版本不存在或不属于该项目');
+  if (result.status === 'paragraph_not_found') {
+    return res.status(404).json({
+      error: `段落不存在：该版本共 ${result.paragraph_count} 段，段落序号需在 1～${result.paragraph_count} 之间`,
+      paragraph_count: result.paragraph_count,
+    });
+  }
+  res.json(result.result);
 });
 
 // ---------- 比对结果 ----------

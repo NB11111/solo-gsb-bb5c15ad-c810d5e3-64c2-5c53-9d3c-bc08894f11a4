@@ -6,6 +6,8 @@ const STATUS_LABEL = { open: '待处理', resolved: '已解决', pending_review:
 const TYPE_LABEL = { added: '新增', removed: '删除', changed: '修改' };
 const DECISION_LABEL = { accepted: '接受变更', rejected: '拒绝变更', deferred: '暂缓' };
 const SOURCE_LABEL = { unchanged: '未变更', new: '采用新版', old: '恢复旧版' };
+const LINEAGE_RELATION_LABEL = { unchanged: '未变', modified: '修改', replaced: '新增替代', deleted: '删除' };
+const LINEAGE_TERMINAL_LABEL = { deleted: '该段在此版本被删除，分支终止', branch_tip: '该版本之后再无后续版本（分支末梢）' };
 
 const app = document.getElementById('app');
 
@@ -109,6 +111,7 @@ async function renderProjects() {
 
 async function renderProject(id) {
   const { project, versions, comparisons } = await api('GET', `/api/projects/${id}`);
+  lineage.activateProject(id, versions);
   app.innerHTML = `
     <nav class="crumbs"><a href="#/">全部项目</a> / ${esc(project.name)}</nav>
     <section class="panel">
@@ -145,7 +148,8 @@ async function renderProject(id) {
               ? '<span class="base-chip first">首版 · 仅存档</span>'
               : `<span class="base-chip" title="该版本导入时所选的比对基线">⟂ 基线：v${v.baseline_seq} ${esc(v.baseline_label)}</span>`}
             </li>`).join('')}
-        </ol>`}
+        </ol>
+        <div id="lineage-panel-mount"></div>`}
 
       <h3>比对记录</h3>
       ${comparisons.length === 0 ? '<p class="empty">导入两个以上版本后，这里会列出差异比对。</p>' : `
@@ -169,6 +173,265 @@ async function renderProject(id) {
             </div>
           </a>`).join('')}</div>`}
     </section>`;
+  lineage.mount();
+}
+
+/* ================= 视图：条款沿革 ================= */
+
+/**
+ * 条款沿革模块状态（按项目隔离）：
+ *  - projectId / versions：当前项目与版本列表（项目详情接口已带）
+ *  - paragraphsByVersion：懒加载的各版本段落列表（重复文本按段落序号选择，不做全文匹配）
+ *  - selected：当前追踪起点 {versionId, paragraph}
+ *  - tree / loading / error：最近一次查询结果
+ *  - expanded：展开的树节点 node_id 集合（删除事件叶子不展开）
+ */
+const lineage = {
+  projectId: null,
+  versions: [],
+  paragraphsByVersion: {},
+  selected: null,
+  tree: null,
+  loading: false,
+  error: null,
+  expanded: new Set(),
+
+  activateProject(projectId, versions) {
+    if (this.projectId !== projectId) {
+      this.projectId = projectId;
+      this.paragraphsByVersion = {};
+      this.selected = null;
+      this.tree = null;
+      this.error = null;
+      this.expanded = new Set();
+    }
+    this.versions = versions;
+  },
+
+  /** DOM 渲染完成后挂载：懒加载首个版本段落，并在需要时自动刷新树 */
+  mount() {
+    const mount = document.getElementById('lineage-panel-mount');
+    if (!mount || !this.projectId) return;
+    if (!this.selected) {
+      const first = [...this.versions].sort((a, b) => a.seq - b.seq)[0];
+      if (first) {
+        this.selected = { versionId: first.id, paragraph: 1 };
+        this.loading = true;
+        this.ensureParagraphs(first.id)
+          .then(() => this.fetchTree())
+          .catch((err) => {
+            this.error = err.message;
+          })
+          .finally(() => {
+            this.loading = false;
+            this.drawPanel();
+          });
+      }
+    } else if (this.tree) {
+      // 项目详情刚刷新（如刚导入新版本）：沿用起点重新追踪
+      const stillExists = this.versions.some((v) => v.id === this.selected.versionId);
+      if (stillExists) {
+        this.loading = true;
+        this.ensureParagraphs(this.selected.versionId)
+          .then(() => this.fetchTree())
+          .catch((err) => {
+            this.error = err.message;
+          })
+          .finally(() => {
+            this.loading = false;
+            this.drawPanel();
+          });
+      }
+    } else {
+      this.ensureParagraphs(this.selected.versionId).finally(() => this.drawPanel());
+    }
+    this.drawPanel();
+  },
+
+  async ensureParagraphs(versionId) {
+    if (this.paragraphsByVersion[versionId]) return this.paragraphsByVersion[versionId];
+    const data = await api('GET', `/api/projects/${this.projectId}/versions/${versionId}/paragraphs`);
+    this.paragraphsByVersion[versionId] = data;
+    return data;
+  },
+
+  async selectStart(versionId, paragraph, { autoLoad } = {}) {
+    this.selected = { versionId, paragraph };
+    this.tree = null;
+    this.error = null;
+    this.expanded = new Set();
+    this.drawPanel();
+    try {
+      await this.ensureParagraphs(versionId);
+      this.drawPanel(); // 段落下拉已就绪
+      if (autoLoad) await this.fetchAndDraw();
+    } catch (err) {
+      this.error = err.message;
+      this.drawPanel();
+    }
+  },
+
+  async fetchAndDraw() {
+    if (!this.selected) return;
+    this.loading = true;
+    this.error = null;
+    this.drawPanel();
+    try {
+      await this.fetchTree();
+    } catch (err) {
+      this.error = err.message;
+    } finally {
+      this.loading = false;
+      this.drawPanel();
+    }
+  },
+
+  async fetchTree() {
+    const { versionId, paragraph } = this.selected;
+    this.tree = await api(
+      'GET',
+      `/api/projects/${this.projectId}/lineage?version_id=${versionId}&paragraph=${paragraph}`
+    );
+  },
+
+  toggleNode(nodeId) {
+    if (this.expanded.has(nodeId)) this.expanded.delete(nodeId);
+    else this.expanded.add(nodeId);
+    this.drawPanel();
+  },
+
+  drawPanel() {
+    const mount = document.getElementById('lineage-panel-mount');
+    if (!mount || !this.projectId) return;
+    mount.innerHTML = this.panelHtml();
+  },
+
+  panelHtml() {
+    const versions = [...this.versions].sort((a, b) => a.seq - b.seq);
+    const selVersionId = this.selected?.versionId ?? versions[0]?.id;
+    const selVersion = versions.find((v) => v.id === selVersionId) ?? null;
+    const paras = selVersionId ? this.paragraphsByVersion[selVersionId] : null;
+    const paraOptions = paras
+      ? paras.paragraphs
+          .map(
+            (p) =>
+              `<option value="${p.ord}" ${this.selected?.paragraph === p.ord ? 'selected' : ''}>¶${p.ord} · ${esc(truncate(p.text, 46))}</option>`
+          )
+          .join('')
+      : '<option value="">段落加载中…</option>';
+
+    return `
+    <div class="lineage-panel">
+      <div class="res-head">
+        <h3>🌳 条款沿革 <span class="dim">按 versions.baseline_id 分支图追踪段落去向，重复文本按段落位置消歧</span></h3>
+      </div>
+      <form id="lineage-form" class="lineage-form">
+        <label>起点版本
+          <select name="version_id">
+            ${versions
+              .map(
+                (v) =>
+                  `<option value="${v.id}" ${selVersionId === v.id ? 'selected' : ''}>v${v.seq} ${esc(v.label)}</option>`
+              )
+              .join('')}
+          </select>
+        </label>
+        <label>起点段落
+          <select name="paragraph">${paraOptions}</select>
+        </label>
+        <button class="btn primary" type="submit" ${paras ? '' : 'disabled'}>追踪沿革</button>
+        ${this.selected && selVersion
+          ? `<span class="dim">当前起点：v${selVersion.seq} ${esc(selVersion.label)} · 段落 ¶${this.selected.paragraph}</span>`
+          : ''}
+      </form>
+      ${paras && this.selected && !this.tree && !this.loading
+        ? `<div class="lineage-preview"><span class="dim">起点条文：</span>${esc(paras.paragraphs[this.selected.paragraph - 1]?.text ?? '')}</div>`
+        : ''}
+      ${this.loading ? '<p class="dim">沿革追踪中…</p>' : ''}
+      ${this.error ? `<p class="error">${esc(this.error)}</p>` : ''}
+      ${this.tree ? this.treeHtml(this.tree) : ''}
+    </div>`;
+  },
+
+  treeHtml(t) {
+    const s = t.stats;
+    const edgeChips = [
+      `<span class="chip lg-unchanged">未变 ${s.edges.unchanged}</span>`,
+      `<span class="chip lg-modified">修改 ${s.edges.modified}</span>`,
+      `<span class="chip lg-replaced">新增替代 ${s.edges.replaced}</span>`,
+      `<span class="chip lg-deleted">删除 ${s.edges.deleted}</span>`,
+    ].join('');
+    return `
+      <div class="lineage-tree-box">
+        <div class="lineage-start">
+          <b>起点：</b><span class="seq-tag">v${t.start.seq}</span>
+          ${esc(t.start.label)} · 段落 ¶${t.start.paragraph}
+          <pre class="lineage-text is-start">${esc(t.start.text)}</pre>
+        </div>
+        <div class="stats">${edgeChips}
+          <span class="chip">触达版本 ${s.versions_reached}</span>
+          <span class="chip">节点 ${s.total_nodes}</span>
+          <span class="chip">分支末梢 ${s.branch_tips}</span>
+        </div>
+        <div class="lineage-tree">${t.tree.children.length ? t.tree.children.map((n) => this.nodeHtml(n)).join('') : '<p class="empty">该版本之后没有以它为基线的后续版本。</p>'}</div>
+        <p class="hint">点击任意版本节点的「以此为起点」可切换追踪起点；分支删除处标注终止原因（删除 / 分支末梢）。</p>
+      </div>`;
+  },
+
+  nodeHtml(n) {
+    const rel = n.incoming.relation;
+    const isDeletion = rel === 'deleted';
+    const hasChildren = n.children.length > 0;
+    const isOpen = this.expanded.has(n.node_id);
+    const caret = hasChildren
+      ? `<button type="button" class="tree-caret" data-action="lineage-toggle" data-node="${n.node_id}"
+           title="${isOpen ? '收起' : '展开'}">${isOpen ? '▾' : '▸'}</button>`
+      : '<span class="tree-caret leaf">•</span>';
+
+    const edgeDesc = this.edgeDescHtml(n);
+    const terminal = n.terminal
+      ? `<span class="lineage-terminal" title="${esc(LINEAGE_TERMINAL_LABEL[n.terminal])}">⛔ ${esc(LINEAGE_TERMINAL_LABEL[n.terminal])}</span>`
+      : '';
+
+    // 删除事件节点只做只读展示，不能切换起点（其在子版本中不占段落位置）
+    const traceBtn = isDeletion
+      ? ''
+      : `<button type="button" class="btn small" data-action="lineage-reroot" data-version="${n.version_id}" data-paragraph="${n.paragraph}">⇱ 以此为起点</button>`;
+
+    return `
+      <div class="tree-node lg-${rel}${isDeletion ? ' is-deletion' : ''}">
+        <div class="tree-node-head">
+          ${caret}
+          <span class="badge lg-${rel}">${LINEAGE_RELATION_LABEL[rel]}</span>
+          <span class="seq-tag">v${n.seq}</span>
+          <b>${esc(n.label)}</b>
+          ${n.paragraph != null ? `<span class="dim">¶${n.paragraph}</span>` : '<span class="dim">（删除事件）</span>'}
+          ${traceBtn}
+          ${terminal}
+        </div>
+        ${edgeDesc}
+        <pre class="lineage-text">${esc(n.text ?? '（无文本）')}</pre>
+        ${hasChildren ? `<div class="tree-children" ${this.expanded.has(n.node_id) ? '' : 'hidden'}>${n.children.map((c) => this.nodeHtml(c)).join('')}</div>` : ''}
+      </div>`;
+  },
+
+  edgeDescHtml(n) {
+    const inc = n.incoming;
+    const parts = [
+      `<span class="dim">来自 v${inc.from_seq} ¶${inc.from_paragraph}</span>`,
+    ];
+    if (rel_isFragment(inc.relation) && inc.fragment_ord != null) {
+      parts.push(`<span class="dim">关联差异片段 #${inc.fragment_ord}</span>`);
+    }
+    if (inc.relation === 'replaced' && inc.removed_fragment_ord != null) {
+      parts.push(`<span class="dim">原删除片段 #${inc.removed_fragment_ord} 被本段新增替代</span>`);
+    }
+    return `<div class="tree-edge-meta">${parts.join(' · ')}</div>`;
+  },
+};
+
+function rel_isFragment(rel) {
+  return rel === 'modified' || rel === 'replaced' || rel === 'deleted';
 }
 
 /* ================= 视图：比对详情 ================= */
@@ -896,6 +1159,11 @@ document.addEventListener('submit', async (e) => {
         toast('首个版本已存档，再导入一个版本即可比对');
         await renderProject(projectId);
       }
+    } else if (form.id === 'lineage-form') {
+      e.preventDefault();
+      const versionId = Number(form.elements.version_id.value);
+      const paragraph = Number(form.elements.paragraph.value);
+      await lineage.selectStart(versionId, paragraph, { autoLoad: true });
     } else if (form.classList.contains('ann-form')) {
       e.preventDefault();
       const author = form.elements.author.value.trim();
@@ -948,9 +1216,16 @@ document.addEventListener('click', async (e) => {
             : '：批注未迁移';
       }
       toast('示例数据已载入' + migText);
-      location.hash = `#/comparisons/${r.comparisons[r.comparisons.length - 1]}`;
-    } else if (action === 'delete-project') {
-      if (!confirm('确定删除该项目及其全部版本、比对与批注？')) return;
+      // 默认进入主线第二轮比对（v2→v3）；项目页「条款沿革」可查看 v2.1 分叉
+      location.hash = `#/comparisons/${r.mainComparisonId ?? r.comparisons[r.comparisons.length - 1]}`;
+    } else if (action === 'lineage-toggle') {
+      lineage.toggleNode(btn.dataset.node);
+    } else if (action === 'lineage-reroot') {
+      const versionId = Number(btn.dataset.version);
+      const paragraph = Number(btn.dataset.paragraph);
+      await lineage.selectStart(versionId, paragraph, { autoLoad: true });
+      toast('已切换追踪起点');
+    } else if (action === 'delete-project') {      if (!confirm('确定删除该项目及其全部版本、比对与批注？')) return;
       await api('DELETE', `/api/projects/${btn.dataset.id}`);
       location.hash = '#/';
     } else if (action === 'delete-annotation') {
@@ -1175,7 +1450,29 @@ document.addEventListener('click', async (e) => {
 document.addEventListener('change', async (e) => {
   const t = e.target;
   try {
-    if (t.classList.contains('decision-radio')) {
+    if (t.closest('#lineage-form') && t.name === 'version_id') {
+      // 切换版本：懒加载该版本段落，并把起点重置为 ¶1（不立即查询，点击「追踪沿革」）
+      const versionId = Number(t.value);
+      lineage.selected = { versionId, paragraph: 1 };
+      lineage.tree = null;
+      lineage.error = null;
+      lineage.expanded = new Set();
+      lineage.drawPanel();
+      try {
+        await lineage.ensureParagraphs(versionId);
+        lineage.selected = { versionId, paragraph: 1 };
+      } catch (err) {
+        lineage.error = err.message;
+      }
+      lineage.drawPanel();
+    } else if (t.closest('#lineage-form') && t.name === 'paragraph') {
+      if (lineage.selected) {
+        lineage.selected.paragraph = Number(t.value);
+        lineage.tree = null;
+        lineage.error = null;
+        lineage.drawPanel();
+      }
+    } else if (t.classList.contains('decision-radio')) {
       const box = t.closest('.decision-box');
       const detail = box.querySelector('.decision-detail');
       detail.hidden = t.value !== 'deferred';
