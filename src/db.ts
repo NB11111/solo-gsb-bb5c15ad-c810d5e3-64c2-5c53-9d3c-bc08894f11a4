@@ -1,0 +1,169 @@
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
+
+export type DB = Database.Database;
+
+export function createSchema(db: DB): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS projects (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      name       TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS versions (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      label      TEXT NOT NULL,
+      content    TEXT NOT NULL,
+      seq        INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_versions_project ON versions(project_id, seq);
+
+    CREATE TABLE IF NOT EXISTS comparisons (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      old_version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+      new_version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+      sealed_by      TEXT,
+      sealed_at      TEXT,
+      created_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_comparisons_project ON comparisons(project_id);
+
+    CREATE TABLE IF NOT EXISTS fragments (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      ord           INTEGER NOT NULL,
+      type          TEXT NOT NULL CHECK (type IN ('added', 'removed', 'changed')),
+      old_text      TEXT,
+      new_text      TEXT,
+      old_start     INTEGER,
+      new_start     INTEGER,
+      anchor        TEXT,
+      decision      TEXT CHECK (decision IS NULL OR decision IN ('accepted', 'rejected', 'deferred')),
+      decision_reason TEXT,
+      decided_by    TEXT,
+      decided_at    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_fragments_comparison ON fragments(comparison_id, ord);
+
+    CREATE TABLE IF NOT EXISTS annotations (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      fragment_id   INTEGER REFERENCES fragments(id) ON DELETE SET NULL,
+      author        TEXT NOT NULL,
+      content       TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'resolved', 'pending_review')),
+      anchor_text   TEXT,
+      similarity    REAL,
+      migrated_from INTEGER,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+      updated_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_annotations_comparison ON annotations(comparison_id, status);
+
+    -- 迁移复核：每条迁移批注的候选片段及相似度（按 rank 降序排列，auto_chosen 标记自动选中的片段）
+    CREATE TABLE IF NOT EXISTS migration_candidates (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      annotation_id INTEGER NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+      comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      fragment_id   INTEGER NOT NULL REFERENCES fragments(id) ON DELETE CASCADE,
+      side          TEXT NOT NULL CHECK (side IN ('old', 'new')),
+      similarity    REAL NOT NULL,
+      rank          INTEGER NOT NULL,
+      auto_chosen   INTEGER NOT NULL DEFAULT 0,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_migcand_annotation ON migration_candidates(annotation_id, rank);
+    CREATE INDEX IF NOT EXISTS idx_migcand_comparison ON migration_candidates(comparison_id);
+
+    -- 迁移复核：人工重新挂载的操作审计（操作者、时间、来源 / 目标片段）
+    CREATE TABLE IF NOT EXISTS remount_logs (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      annotation_id    INTEGER NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+      comparison_id    INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      from_fragment_id INTEGER REFERENCES fragments(id) ON DELETE SET NULL,
+      to_fragment_id   INTEGER NOT NULL REFERENCES fragments(id) ON DELETE CASCADE,
+      operator         TEXT NOT NULL,
+      similarity       REAL,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_remount_logs_annotation ON remount_logs(annotation_id);
+    CREATE INDEX IF NOT EXISTS idx_remount_logs_comparison ON remount_logs(comparison_id);
+
+    -- 比对级审阅分派：项目负责人为本轮比对登记审阅人名单
+    CREATE TABLE IF NOT EXISTS reviewers (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      name          TEXT NOT NULL,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+      UNIQUE (comparison_id, name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_reviewers_comparison ON reviewers(comparison_id);
+
+    -- 片段分派审计：记录每次分派 / 回收 / 转交 / 认领 / 完成
+    CREATE TABLE IF NOT EXISTS assignment_logs (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      fragment_id   INTEGER NOT NULL REFERENCES fragments(id) ON DELETE CASCADE,
+      comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      action        TEXT NOT NULL CHECK (action IN ('assign', 'reclaim', 'claim', 'complete', 'reopen')),
+      operator      TEXT NOT NULL,
+      from_reviewer_id   INTEGER REFERENCES reviewers(id) ON DELETE SET NULL,
+      to_reviewer_id     INTEGER REFERENCES reviewers(id) ON DELETE SET NULL,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_assignment_logs_fragment ON assignment_logs(fragment_id, id);
+    CREATE INDEX IF NOT EXISTS idx_assignment_logs_comparison ON assignment_logs(comparison_id);
+  `);
+}
+
+/** 旧版本数据库平滑升级：补齐封存 / 片段结论 / 迁移复核相关列 */
+export function migrateSchema(db: DB): void {
+  const addColumnIfMissing = (table: string, column: string, ddl: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    }
+  };
+  addColumnIfMissing('comparisons', 'sealed_by', 'sealed_by TEXT');
+  addColumnIfMissing('comparisons', 'sealed_at', 'sealed_at TEXT');
+  addColumnIfMissing('fragments', 'decision', "decision TEXT");
+  addColumnIfMissing('fragments', 'decision_reason', 'decision_reason TEXT');
+  addColumnIfMissing('fragments', 'decided_by', 'decided_by TEXT');
+  addColumnIfMissing('fragments', 'decided_at', 'decided_at TEXT');
+  addColumnIfMissing('annotations', 'remounted_by', 'remounted_by TEXT');
+  addColumnIfMissing('annotations', 'remounted_at', 'remounted_at TEXT');
+  // 比对级审阅分派：片段的分派状态、当前审阅人与乐观锁版本号
+  addColumnIfMissing(
+    'fragments',
+    'assignee_id',
+    'assignee_id INTEGER REFERENCES reviewers(id) ON DELETE SET NULL'
+  );
+  addColumnIfMissing(
+    'fragments',
+    'assignment_status',
+    "assignment_status TEXT NOT NULL DEFAULT 'unassigned'"
+  );
+  addColumnIfMissing('fragments', 'assign_version', 'assign_version INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing('fragments', 'assigned_by', 'assigned_by TEXT');
+  addColumnIfMissing('fragments', 'assigned_at', 'assigned_at TEXT');
+  addColumnIfMissing('fragments', 'claimed_at', 'claimed_at TEXT');
+  addColumnIfMissing('fragments', 'completed_by', 'completed_by TEXT');
+  addColumnIfMissing('fragments', 'completed_at', 'completed_at TEXT');
+}
+
+export function openDb(dbPath: string): DB {
+  if (dbPath !== ':memory:') {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  createSchema(db);
+  migrateSchema(db);
+  return db;
+}

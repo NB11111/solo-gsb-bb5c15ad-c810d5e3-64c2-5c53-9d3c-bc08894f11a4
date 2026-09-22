@@ -1,0 +1,1277 @@
+'use strict';
+
+/* ================= 基础工具 ================= */
+
+const STATUS_LABEL = { open: '待处理', resolved: '已解决', pending_review: '待复核' };
+const TYPE_LABEL = { added: '新增', removed: '删除', changed: '修改' };
+const DECISION_LABEL = { accepted: '接受变更', rejected: '拒绝变更', deferred: '暂缓' };
+const SOURCE_LABEL = { unchanged: '未变更', new: '采用新版', old: '恢复旧版' };
+
+const app = document.getElementById('app');
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    let msg = `请求失败（${res.status}）`;
+    try {
+      const j = await res.json();
+      if (j.error) msg = j.error;
+    } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+let toastTimer = null;
+function toast(msg, isErr = false) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.className = isErr ? 'toast err show' : 'toast show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+const lastAuthor = {
+  get: () => localStorage.getItem('review-author') || '',
+  set: (v) => localStorage.setItem('review-author', v),
+};
+
+const lastSealer = {
+  get: () => localStorage.getItem('review-sealer') || '',
+  set: (v) => localStorage.setItem('review-sealer', v),
+};
+
+const lastLead = {
+  get: () => localStorage.getItem('review-lead') || '',
+  set: (v) => localStorage.setItem('review-lead', v),
+};
+
+/** 当前审阅人身份（id/姓名），按比对分别记忆；未选择时为 null */
+const currentReviewer = {
+  key: (comparisonId) => `review-current-reviewer-${comparisonId}`,
+  get(comparisonId) {
+    try {
+      return JSON.parse(localStorage.getItem(this.key(comparisonId)) || 'null');
+    } catch {
+      return null;
+    }
+  },
+  set(comparisonId, v) {
+    localStorage.setItem(this.key(comparisonId), JSON.stringify(v));
+  },
+  clear(comparisonId) {
+    localStorage.removeItem(this.key(comparisonId));
+  },
+};
+
+/* ================= 视图：项目列表 ================= */
+
+async function renderProjects() {
+  const { projects } = await api('GET', '/api/projects');
+  app.innerHTML = `
+    <section class="panel">
+      <div class="panel-head">
+        <h2>审阅项目</h2>
+        <button class="btn" data-action="load-demo">⚡ 载入示例数据</button>
+      </div>
+      <form id="create-project-form" class="inline-form">
+        <input name="name" required maxlength="100" placeholder="新项目名称，如：《数据安全管理办法》">
+        <button class="btn primary" type="submit">新建项目</button>
+      </form>
+      ${projects.length === 0
+        ? '<p class="empty">还没有项目。新建一个项目，或点击「载入示例数据」快速体验完整流程。</p>'
+        : `<div class="cards">${projects.map((p) => `
+            <a class="card" href="#/projects/${p.id}">
+              <div class="card-title">${esc(p.name)}</div>
+              <div class="card-meta">${p.version_count} 个版本 · ${p.comparison_count} 轮比对</div>
+              <div class="card-meta dim">创建于 ${esc(p.created_at)}</div>
+            </a>`).join('')}</div>`}
+    </section>`;
+}
+
+/* ================= 视图：项目详情 ================= */
+
+async function renderProject(id) {
+  const { project, versions, comparisons } = await api('GET', `/api/projects/${id}`);
+  app.innerHTML = `
+    <nav class="crumbs"><a href="#/">全部项目</a> / ${esc(project.name)}</nav>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>${esc(project.name)}</h2>
+        <button class="btn danger" data-action="delete-project" data-id="${project.id}">删除项目</button>
+      </div>
+
+      <h3>导入新版本</h3>
+      <form id="import-form" data-project="${project.id}" class="import-form">
+        <input name="label" required maxlength="100" placeholder="版本标签，如：v2.0 送审稿">
+        ${versions.length === 0 ? '' : `
+        <label class="baseline-pick">比对基线
+          <select name="baseline_version_id">
+            ${[...versions]
+              .sort((a, b) => b.seq - a.seq)
+              .map((v, i) =>
+                `<option value="${v.id}">${i === 0 ? '最新版本：' : ''}v${v.seq} ${esc(v.label)}</option>`)
+              .join('')}
+          </select>
+        </label>`}
+        <textarea name="content" required rows="9"
+          placeholder="粘贴规范全文。段落之间用空行分隔；若无空行，则每行视为一条。"></textarea>
+        <button class="btn primary" type="submit">导入并按所选基线比对</button>
+        <p class="hint">首个版本仅存档；其后默认与<b>最新版本</b>比对，也可选择项目内任一更早的历史版本作为基线。批注只会从「以所选基线为新版」的最近一轮比对迁移。</p>
+      </form>
+
+      <h3>版本记录</h3>
+      ${versions.length === 0 ? '<p class="empty">尚未导入任何版本。</p>' : `
+        <ol class="version-list">
+          ${versions.map((v) => `<li><span class="tag">v${v.seq}</span> ${esc(v.label)}
+            <span class="dim">${esc(v.created_at)}</span>
+            ${v.baseline_id == null
+              ? '<span class="base-chip first">首版 · 仅存档</span>'
+              : `<span class="base-chip" title="该版本导入时所选的比对基线">⟂ 基线：v${v.baseline_seq} ${esc(v.baseline_label)}</span>`}
+            </li>`).join('')}
+        </ol>`}
+
+      <h3>比对记录</h3>
+      ${comparisons.length === 0 ? '<p class="empty">导入两个以上版本后，这里会列出差异比对。</p>' : `
+        <div class="cards">${comparisons.map((c) => `
+          <a class="card${c.sealed_at ? ' sealed' : ''}" href="#/comparisons/${c.id}">
+            <div class="card-title">
+              ${c.sealed_at
+                ? '<span class="seal-badge">🔒 已封存</span>'
+                : '<span class="draft-badge">📝 草稿</span>'}
+              <span class="seq-tag">v${c.old_seq}</span>
+              ${esc(c.old_label)} → <span class="seq-tag">v${c.new_seq}</span> ${esc(c.new_label)}
+            </div>
+            ${c.new_seq !== c.old_seq + 1
+              ? `<div class="base-rel">⟂ 跨版本基线：新版 v${c.new_seq} 以更早的 v${c.old_seq} 为基线（中间隔 ${c.new_seq - c.old_seq - 1} 个版本）</div>`
+              : '<div class="base-rel adjacent">相邻版本比对</div>'}
+            <div class="card-meta">${c.fragment_count} 处差异 · ${c.annotation_count} 条批注
+              ${c.open_count > 0 ? ` · <b class="warn">${c.open_count} 条批注待办</b>` : ''}
+              ${!c.sealed_at && c.undecided_count > 0 ? ` · <b class="warn">${c.undecided_count} 个片段未结论</b>` : ''}</div>
+            <div class="card-meta dim">
+              ${c.sealed_at ? `封存人 ${esc(c.sealed_by || '（未署名）')} · ${esc(c.sealed_at)}` : esc(c.created_at)}
+            </div>
+          </a>`).join('')}</div>`}
+    </section>`;
+}
+
+/* ================= 视图：比对详情 ================= */
+
+const ASSIGNMENT_LABEL = { unassigned: '未分派', assigned: '已分派', completed: '已完成' };
+
+const cmp = {
+  id: null,
+  data: null,
+  status: 'all',
+  author: 'all',
+  onlyAnnotated: false,
+  resolution: null,
+  showMigrationReport: false,
+  migrationReport: null,
+  remountFor: null,
+  remountCandidates: {},
+  // 比对级审阅分派
+  assigneeFilter: 'all',        // all / unassigned / assigned / completed / reviewer:<id>
+  selectedFragments: new Set(), // 负责人批量勾选的片段 id
+};
+
+async function renderComparison(id) {
+  const data = await api('GET', `/api/comparisons/${id}`);
+  if (cmp.id !== id) {
+    cmp.status = 'all';
+    cmp.author = 'all';
+    cmp.onlyAnnotated = false;
+    cmp.showMigrationReport = false;
+    cmp.migrationReport = null;
+    cmp.remountFor = null;
+    cmp.remountCandidates = {};
+    cmp.assigneeFilter = 'all';
+    cmp.selectedFragments = new Set();
+  }
+  cmp.id = id;
+  cmp.data = data;
+  cmp.resolution = null; // 结论可能已变化，决议稿需重新生成
+  if (cmp.showMigrationReport) {
+    // 报告保持展开时随详情一起刷新（如刚完成一次重挂）
+    cmp.migrationReport = await api('GET', `/api/comparisons/${id}/migration-report`);
+  }
+  drawComparison();
+}
+
+function allAnnotations(data = cmp.data) {
+  const anns = [];
+  for (const f of data.fragments) anns.push(...f.annotations);
+  anns.push(...data.unanchored);
+  return anns;
+}
+
+function visibleAnnotations(anns) {
+  return anns.filter(
+    (a) =>
+      (cmp.status === 'all' || a.status === cmp.status) &&
+      (cmp.author === 'all' || a.author === cmp.author)
+  );
+}
+
+function annHtml(a) {
+  const sealed = !!cmp.data.comparison.sealed_at;
+  const migrated = a.migrated_from != null
+    ? `<span class="migrated" title="从上一轮比对自动迁移">⤳ 迁移${a.similarity != null ? ` · 相似度 ${(a.similarity * 100).toFixed(0)}%` : ''}</span>`
+    : '';
+  const remounted = a.remounted_by
+    ? `<span class="remounted" title="人工选择候选片段重新挂载">🔄 重挂 · ${esc(a.remounted_by)}${a.remounted_at ? ` · ${esc(a.remounted_at)}` : ''}</span>`
+    : '';
+  return `
+    <div class="ann st-${a.status}">
+      <div class="ann-head">
+        <b>${esc(a.author)}</b>
+        <span class="badge st-${a.status}">${STATUS_LABEL[a.status]}</span>
+        ${migrated}
+        ${remounted}
+        <span class="dim">${esc(a.updated_at)}</span>
+      </div>
+      <div class="ann-body">${esc(a.content)}</div>
+      ${sealed ? '' : `
+      <div class="ann-actions">
+        <select class="ann-status" data-id="${a.id}" title="更新状态">
+          ${Object.entries(STATUS_LABEL).map(([v, l]) =>
+            `<option value="${v}" ${v === a.status ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+        <button class="btn small danger" data-action="delete-annotation" data-id="${a.id}">删除</button>
+      </div>`}
+    </div>`;
+}
+
+function decisionHtml(f) {
+  const sealed = !!cmp.data.comparison.sealed_at;
+  if (sealed) {
+    if (!f.decision) return '<div class="decision-box dc-none">封存时该片段无结论记录</div>';
+    const who = f.decided_by ? `（${esc(f.decided_by)}${f.decided_at ? ` · ${esc(f.decided_at)}` : ''}）` : '';
+    return `
+      <div class="decision-box dc-${f.decision}">
+        <span class="badge dc-${f.decision}">${DECISION_LABEL[f.decision]}</span>
+        ${f.decision === 'deferred' && f.decision_reason
+          ? `<span class="decision-reason">暂缓理由：${esc(f.decision_reason)}</span>` : ''}
+        <span class="dim">${who}</span>
+      </div>`;
+  }
+  const options = [
+    { v: 'accepted', l: '接受变更' },
+    { v: 'rejected', l: '拒绝变更' },
+    { v: 'deferred', l: '暂缓（需填理由）' },
+  ];
+  return `
+    <div class="decision-box" data-fragment="${f.id}">
+      <span class="decision-label">审阅结论：</span>
+      <div class="decision-opts" role="radiogroup">
+        ${options.map((o) => `
+          <label class="decision-opt dc-${o.v}${f.decision === o.v ? ' picked' : ''}">
+            <input type="radio" class="decision-radio" name="decision-${f.id}" value="${o.v}"
+              ${f.decision === o.v ? 'checked' : ''}>
+            ${o.l}
+          </label>`).join('')}
+      </div>
+      <div class="decision-detail" ${f.decision === 'deferred' ? '' : 'hidden'}>
+        <input class="decision-reason-input" maxlength="1000" placeholder="必须填写暂缓理由，保存后生效"
+          value="${esc(f.decision_reason ?? '')}">
+      </div>
+      <div class="decision-actions">
+        <button class="btn small primary" data-action="save-decision" data-id="${f.id}">保存结论</button>
+        <span class="dim">切换选项后点击保存；暂缓需先填写理由</span>
+      </div>
+      ${f.decision && f.decided_by
+        ? `<span class="dim">当前结论提出人：${esc(f.decided_by)}${f.decided_at ? ` · ${esc(f.decided_at)}` : ''}</span>`
+        : ''}
+    </div>`;
+}
+
+function fragHtml(f) {
+  const sealed = !!cmp.data.comparison.sealed_at;
+  const anns = visibleAnnotations(f.annotations);
+  const pos = [
+    f.old_start != null ? `旧¶${f.old_start}` : null,
+    f.new_start != null ? `新¶${f.new_start}` : null,
+  ].filter(Boolean).join(' → ');
+  return `
+    <div class="fragment ft-${f.type}">
+      <div class="frag-head">
+        <span class="badge ft-${f.type}">${TYPE_LABEL[f.type]}</span>
+        <span class="dim">片段 #${f.ord}${pos ? ` · ${pos}` : ''} · ${f.annotations.length} 条批注</span>
+        ${f.decision ? `<span class="badge dc-${f.decision}">${DECISION_LABEL[f.decision]}</span>` : '<span class="badge dc-none">未结论</span>'}
+      </div>
+      ${f.old_text != null ? `<pre class="frag-text old">${esc(f.old_text)}</pre>` : ''}
+      ${f.new_text != null ? `<pre class="frag-text new">${esc(f.new_text)}</pre>` : ''}
+      ${fragmentAssignmentHtml(f)}
+      ${decisionHtml(f)}
+      <div class="anns">${anns.map(annHtml).join('')}</div>
+      ${sealed ? '' : `
+      <form class="ann-form" data-fragment="${f.id}">
+        <input name="author" required maxlength="50" placeholder="作者" value="${esc(lastAuthor.get())}">
+        <input name="content" required maxlength="2000" placeholder="写下审阅意见…">
+        <button class="btn small primary" type="submit">批注</button>
+      </form>`}
+    </div>`;
+}
+
+function sealBlockers(data) {
+  const blockers = [];
+  for (const f of data.fragments) {
+    if (!f.decision) blockers.push({ kind: 'undecided_fragment', message: `片段 #${f.ord} 尚未作出审阅结论` });
+  }
+  for (const a of allAnnotations(data)) {
+    if (a.status === 'open') {
+      blockers.push({ kind: 'open_annotation', message: `存在未解决批注 #${a.id}${a.fragment_id == null ? '（位于待复核区）' : ''}` });
+    } else if (a.status === 'pending_review') {
+      blockers.push({ kind: 'pending_review_annotation', message: `存在待复核批注 #${a.id}${a.fragment_id == null ? '（位于待复核区）' : ''}` });
+    }
+  }
+  return blockers;
+}
+
+function sealPanelHtml(data) {
+  const blockers = sealBlockers(data);
+  const undecided = data.stats.decisions.undecided;
+  const openAnn = data.stats.annotations.open;
+  const pendingAnn = data.stats.annotations.pending_review;
+  const canSeal = blockers.length === 0;
+  const preview = blockers.slice(0, 8).map((b) => `<li>${esc(b.message)}</li>`).join('');
+  const more = blockers.length > 8 ? `<li class="dim">…另有 ${blockers.length - 8} 项</li>` : '';
+  return `
+    <div class="seal-panel${canSeal ? ' ready' : ''}">
+      <div class="seal-summary">
+        <h3>🔖 审阅封存</h3>
+        <div class="seal-counts">
+          <span class="${undecided > 0 ? 'warn' : 'ok'}">未作结论片段：${undecided}</span>
+          <span class="${openAnn > 0 ? 'warn' : 'ok'}">未解决批注：${openAnn}</span>
+          <span class="${pendingAnn > 0 ? 'warn' : 'ok'}">待复核批注：${pendingAnn}</span>
+        </div>
+      </div>
+      ${blockers.length > 0 ? `
+        <ul class="blocker-list">${preview}${more}</ul>
+        <p class="hint">所有片段均已有结论，且不存在未解决或待复核批注时，方可封存。</p>` : ''}
+      <div class="seal-form-row">
+        <input id="seal-by" maxlength="50" placeholder="封存人姓名" value="${esc(lastSealer.get())}">
+        <button class="btn primary" data-action="seal" data-id="${data.comparison.id}" ${canSeal ? '' : 'disabled'}>
+          ${canSeal ? '确认封存' : '尚有阻塞项，无法封存'}
+        </button>
+      </div>
+    </div>`;
+}
+
+/* ================= 比对级审阅分派 ================= */
+
+function currentReviewerObj() {
+  return currentReviewer.get(cmp.id);
+}
+
+/** 分派面板：名单管理 + 各人完成进度 + 当前身份切换 */
+function assignmentPanelHtml() {
+  const { assignment, comparison } = cmp.data;
+  const sealed = !!comparison.sealed_at;
+  const s = assignment.summary;
+  const total = s.total_fragments || 1;
+  const me = currentReviewerObj();
+
+  const reviewerRows = assignment.reviewers.map((r) => {
+    const pct = r.total_count === 0 ? 0 : Math.round((r.completed_count / r.total_count) * 100);
+    const mine = me && me.id === r.id;
+    return `
+      <tr${mine ? ' class="auto-chosen"' : ''}>
+        <td>
+          <b>${esc(r.name)}</b>${mine ? ' <span class="dim">（当前身份）</span>' : ''}
+        </td>
+        <td>${r.assigned_count}</td>
+        <td>${r.completed_count}</td>
+        <td>${r.total_count}</td>
+        <td class="prog-cell">
+          <span class="sim-bar"><span class="sim-fill" style="width:${pct}%"></span></span>${pct}%
+        </td>
+        <td>
+          ${sealed ? '' : `<button class="btn small danger" data-action="remove-reviewer" data-id="${r.id}">移除</button>`}
+        </td>
+      </tr>`;
+  }).join('');
+
+  const meOptions = assignment.reviewers.map((r) =>
+    `<option value="${r.id}" ${me && me.id === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('');
+
+  return `
+    <div class="assignment-panel">
+      <div class="res-head">
+        <h3>👥 审阅分派 <span class="dim">负责人登记审阅人名单并按片段批量分派</span></h3>
+        <div class="identity-pick">
+          <span class="dim">我的审阅人身份：</span>
+          <select id="current-reviewer" title="选择身份后可认领未分派片段、更新完成状态">
+            <option value="">未选择（负责人视角）</option>
+            ${meOptions}
+          </select>
+        </div>
+      </div>
+
+      <div class="stats">
+        <span class="chip assign-unassigned${s.unassigned > 0 ? ' hot' : ''}">未分派 ${s.unassigned}</span>
+        <span class="chip assign-assigned${s.assigned > 0 ? ' hot' : ''}">已分派 ${s.assigned}</span>
+        <span class="chip assign-completed">已完成 ${s.completed}</span>
+        <span class="chip">总进度 ${s.completed}/${s.total_fragments}（${Math.round((s.completed / total) * 100)}%）</span>
+      </div>
+
+      ${sealed ? '' : `
+      <form id="add-reviewer-form" class="inline-form">
+        <input name="name" required maxlength="50" placeholder="审阅人姓名，如：王法务" value="${esc(lastAuthor.get())}">
+        <button class="btn primary" type="submit">＋ 登记审阅人</button>
+      </form>`}
+
+      ${assignment.reviewers.length === 0
+        ? '<p class="empty">尚未登记审阅人。负责人先登记名单，随后可在各片段或勾选多个片段批量分派。</p>'
+        : `<table class="cand-table reviewer-table">
+            <thead><tr><th>审阅人</th><th>进行中</th><th>已完成</th><th>合计</th><th>完成进度</th><th>操作</th></tr></thead>
+            <tbody>${reviewerRows}</tbody>
+          </table>`}
+      <p class="hint">
+        状态说明：<b>未分派 → 已分派 → 已完成</b>。审阅人认领时服务端按版本号原子校验，冲突会返回当前负责人而不覆盖；
+        负责人可回收未完成分派再转交，已完成片段不会被覆盖。
+      </p>
+    </div>`;
+}
+
+/** 片段上的分派条：状态徽标、负责人、认领 / 完成操作、负责人单片段分派 */
+function fragmentAssignmentHtml(f) {
+  const assignment = f;
+  const sealed = !!cmp.data.comparison.sealed_at;
+  const me = currentReviewerObj();
+  const reviewers = cmp.data.assignment.reviewers;
+
+  const badge =
+    assignment.assignment_status === 'unassigned'
+      ? '<span class="badge assign-unassigned">⬚ 未分派</span>'
+      : assignment.assignment_status === 'completed'
+        ? '<span class="badge assign-completed">✅ 已完成</span>'
+        : '<span class="badge assign-assigned">▷ 已分派</span>';
+
+  const who = assignment.assignee_name
+    ? `<b>${esc(assignment.assignee_name)}</b>${assignment.claimed_at ? ` · 认领于 ${esc(assignment.claimed_at)}` : ''}`
+    : '<span class="dim">无</span>';
+  const completedMeta = assignment.assignment_status === 'completed'
+    ? `<span class="dim">完成人：${esc(assignment.completed_by || assignment.assignee_name || '')}${assignment.completed_at ? ` · ${esc(assignment.completed_at)}` : ''}</span>`
+    : '';
+
+  const checkbox = sealed
+    ? ''
+    : `<label class="frag-pick" title="负责人批量分派时勾选（已完成片段不可勾选）">
+         <input type="checkbox" class="frag-select" data-id="${f.id}"
+           ${assignment.assignment_status === 'completed' ? 'disabled' : ''}
+           ${cmp.selectedFragments.has(f.id) ? 'checked' : ''}>
+       </label>`;
+
+  let actions = '';
+  if (!sealed) {
+    if (me) {
+      if (assignment.assignment_status === 'unassigned') {
+        actions = `<button class="btn small primary" data-action="claim" data-id="${f.id}" data-version="${assignment.assign_version}">🙋 我认领</button>`;
+      } else if (assignment.assignee_id === me.id) {
+        if (assignment.assignment_status === 'assigned') {
+          // 负责人直接分派时尚未本人确认：可先确认认领（补登记时间），再标记完成
+          const ackBtn = assignment.claimed_at
+            ? ''
+            : `<button class="btn small" data-action="claim" data-id="${f.id}" data-version="${assignment.assign_version}">🙋 确认认领</button>`;
+          actions = `${ackBtn}<button class="btn small primary" data-action="complete" data-id="${f.id}" data-version="${assignment.assign_version}">✅ 标记完成</button>`;
+        } else {
+          actions = `<button class="btn small" data-action="reopen" data-id="${f.id}" data-version="${assignment.assign_version}">↩ 退回进行中</button>`;
+        }
+      } else {
+        actions = '<span class="dim">当前由其他审阅人负责</span>';
+      }
+    }
+    // 负责人视角（或任何已登记名单之外的操作）始终提供单片段分派入口
+    const opts = [
+      `<option value="">— ${assignment.assignment_status === 'unassigned' ? '分派给…' : '转交 / 回收…'} —</option>`,
+      ...reviewers.map((r) =>
+        `<option value="${r.id}" ${assignment.assignee_id === r.id ? 'disabled' : ''}>分派给 ${esc(r.name)}</option>`),
+    ];
+    if (assignment.assignment_status !== 'unassigned') {
+      opts.push('<option value="__reclaim__">♻ 回收到未分派</option>');
+    }
+    actions += `
+      <select class="frag-assign" data-id="${f.id}" data-current="${assignment.assignee_id ?? ''}">${opts.join('')}</select>`;
+  }
+
+  return `
+    <div class="frag-assignment st-${assignment.assignment_status}">
+      ${checkbox}
+      ${badge}
+      <span class="dim">负责人：</span>${who}
+      ${completedMeta}
+      <span class="assign-actions">${actions}</span>
+    </div>`;
+}
+
+/** 负责人批量分派操作条 */
+function batchAssignBarHtml(fragments) {
+  const sealed = !!cmp.data.comparison.sealed_at;
+  if (sealed) return '';
+  const selectable = fragments.filter((f) => f.assignment_status !== 'completed');
+  const selectedIds = selectable
+    .map((f) => f.id)
+    .filter((id) => cmp.selectedFragments.has(id));
+  if (selectedIds.length === 0) return '';
+  const reviewerOpts = cmp.data.assignment.reviewers
+    .map((r) => `<option value="${r.id}">${esc(r.name)}</option>`)
+    .join('');
+  return `
+    <div class="batch-assign-bar">
+      <span>已选 <b>${selectedIds.length}</b> 个未完成片段：</span>
+      <select id="batch-reviewer">
+        <option value="">分派 / 转交给…</option>
+        ${reviewerOpts}
+        <option value="__reclaim__">♻ 回收为未分派</option>
+      </select>
+      <button class="btn small primary" data-action="batch-assign">应用到所选片段</button>
+      <button class="btn small" data-action="clear-selection">清除选择</button>
+      <span class="dim">已完成片段即使勾选也会被跳过</span>
+    </div>`;
+}
+
+/* ================= 决议稿 ================= */
+
+function resolutionHtml(r) {
+  const paras = r.paragraphs.map((p) => {
+    const fragTag = p.fragment_ord != null
+      ? `片段 #${p.fragment_ord}（${TYPE_LABEL[p.fragment_type]} · ${DECISION_LABEL[p.decision]}）`
+      : '无对应差异片段';
+    return `
+      <div class="res-para src-${p.source}${p.decision === 'deferred' ? ' is-deferred' : ''}">
+        <div class="res-meta">
+          <span class="res-ord">¶${p.ord}</span>
+          <span class="badge src-${p.source}">${SOURCE_LABEL[p.source]}</span>
+          ${p.decision === 'deferred' ? '<span class="badge dc-deferred">暂缓</span>' : ''}
+          <span class="dim">${fragTag}</span>
+        </div>
+        <pre class="res-text">${esc(p.text)}</pre>
+      </div>`;
+  }).join('');
+
+  const todos = r.todos.map((t) => `
+    <li class="todo-item">
+      <div>
+        <b>片段 #${t.fragment_ord}（${TYPE_LABEL[t.fragment_type]}）</b>
+        <span class="dim">${t.kept === 'absent' ? '决议稿暂维持删除（新版不含该段）' : '决议稿暂保留新版内容'}</span>
+      </div>
+      <div class="todo-reason">暂缓理由：${esc(t.reason)}</div>
+      <div class="dim">提出人：${esc(t.decided_by || '（未署名）')}${t.decided_at ? ` · ${esc(t.decided_at)}` : ''}</div>
+    </li>`).join('');
+
+  return `
+    <div class="resolution-panel">
+      <div class="res-head">
+        <h3>📄 决议稿 <span class="dim">生成于 ${esc(r.generated_at)} · 共 ${r.stats.total} 段</span></h3>
+        <div class="res-actions">
+          <a class="btn small" href="/api/comparisons/${cmp.id}/resolution?format=md">⬇ 下载 Markdown（UTF-8）</a>
+          <button class="btn small" data-action="close-resolution">收起</button>
+        </div>
+      </div>
+      <div class="stats">
+        <span class="chip src-unchanged">未变更 ${r.stats.unchanged}</span>
+        <span class="chip src-new">采用新版 ${r.stats.from_new}</span>
+        <span class="chip src-old">恢复旧版 ${r.stats.from_old}</span>
+        <span class="chip dc-deferred${r.stats.deferred > 0 ? ' hot' : ''}">暂缓待办 ${r.stats.deferred}</span>
+      </div>
+      ${r.todos.length > 0 ? `
+        <div class="todo-box">
+          <h4>⏸ 暂缓待办清单（${r.todos.length} 项）</h4>
+          <ol>${todos}</ol>
+        </div>` : ''}
+      <div class="res-body">${paras}</div>
+    </div>`;
+}
+
+function resolutionBarHtml(data) {
+  const undecided = data.stats.decisions.undecided;
+  const ready = undecided === 0;
+  return `
+    <div class="resolution-bar">
+      <button class="btn" data-action="gen-resolution" ${ready ? '' : 'disabled'}
+        title="${ready ? '依据全部片段结论重建正文' : '尚有片段未作结论'}">📄 生成决议稿</button>
+      <span class="dim">${ready
+        ? '全部片段已有结论：接受 → 采用新版，拒绝 → 恢复旧版，暂缓 → 暂保留新版并列入待办清单'
+        : `尚有 ${undecided} 个片段未作结论，全部有结论后才能生成决议稿`}</span>
+    </div>
+    ${cmp.resolution ? resolutionHtml(cmp.resolution) : ''}`;
+}
+
+/* ================= 迁移复核 ================= */
+
+function truncate(s, n) {
+  const t = String(s ?? '');
+  return t.length > n ? t.slice(0, n) + '…' : t;
+}
+
+function migrationBarHtml() {
+  return `
+    <div class="migration-bar">
+      <button class="btn" data-action="toggle-migration-report">
+        ${cmp.showMigrationReport ? '收起迁移复核报告' : '🧭 迁移复核报告'}</button>
+      <span class="dim">查看本轮批注迁移的候选片段与相似度；待复核批注可在下方待复核区选择候选片段重新挂载</span>
+    </div>
+    ${cmp.showMigrationReport && cmp.migrationReport ? migrationReportHtml(cmp.migrationReport) : ''}`;
+}
+
+function migrationReportHtml(r) {
+  const s = r.summary;
+  const items = r.items.map((it) => {
+    const mount = it.fragment_ord != null
+      ? `当前挂载：片段 #${it.fragment_ord}`
+      : '<b class="warn">待复核 · 未挂载片段</b>';
+    const candRows = it.candidates.map((c) => `
+      <tr${c.auto_chosen ? ' class="auto-chosen"' : ''}>
+        <td>${c.rank}</td>
+        <td>#${c.fragment_ord}</td>
+        <td><span class="badge ft-${c.fragment_type}">${TYPE_LABEL[c.fragment_type]}</span></td>
+        <td>${c.side === 'old' ? '旧文本' : '新文本'}</td>
+        <td>
+          <span class="sim-bar"><span class="sim-fill" style="width:${Math.round(c.similarity * 100)}%"></span></span>
+          ${(c.similarity * 100).toFixed(1)}%
+        </td>
+        <td>${c.auto_chosen ? '✓ 自动选中' : ''}</td>
+      </tr>`).join('');
+    const remounts = it.remounts.map((l) => `
+      <li>🔄 <b>${esc(l.operator)}</b> 于 ${esc(l.created_at)} 重挂：
+        ${l.from_fragment_ord != null ? `片段 #${l.from_fragment_ord}` : '未挂载'} → 片段 #${l.to_fragment_ord ?? l.to_fragment_id}${l.similarity != null ? `（相似度 ${(l.similarity * 100).toFixed(0)}%）` : ''}</li>`).join('');
+    return `
+      <div class="mig-item">
+        <div class="mig-head">
+          <b>批注 #${it.annotation_id}</b>
+          <span>${esc(it.author)}</span>
+          <span class="badge st-${it.status}">${STATUS_LABEL[it.status]}</span>
+          <span class="migrated">⤳ 迁移${it.similarity != null ? ` · 相似度 ${(it.similarity * 100).toFixed(0)}%` : ''}</span>
+          <span class="dim">${mount}</span>
+          ${it.remounted_by
+            ? `<span class="remounted">🔄 重挂 · ${esc(it.remounted_by)}${it.remounted_at ? ` · ${esc(it.remounted_at)}` : ''}</span>`
+            : ''}
+        </div>
+        <div class="anchor-text">锚点文本：${esc(it.anchor_text ?? '（空）')}</div>
+        <div class="mig-content">${esc(it.content)}</div>
+        ${it.candidates.length > 0 ? `
+          <table class="cand-table">
+            <thead><tr><th>#</th><th>片段</th><th>类型</th><th>匹配侧</th><th>相似度</th><th>选中</th></tr></thead>
+            <tbody>${candRows}</tbody>
+          </table>` : '<p class="dim">迁移时无候选片段记录。</p>'}
+        ${it.remounts.length > 0 ? `<ul class="remount-log">${remounts}</ul>` : ''}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="migration-panel">
+      <div class="res-head">
+        <h3>🧭 迁移复核报告 <span class="dim">本轮从上一轮比对迁移的批注及候选片段</span></h3>
+        <button class="btn small" data-action="toggle-migration-report">收起</button>
+      </div>
+      <div class="stats">
+        <span class="chip">迁移批注 ${s.total}</span>
+        <span class="chip st-resolved">自动锚定 ${s.auto_migrated}</span>
+        <span class="chip st-pending_review${s.pending_review > 0 ? ' hot' : ''}">待复核 ${s.pending_review}</span>
+        <span class="chip">人工重挂 ${s.remounted}</span>
+      </div>
+      ${r.items.length === 0
+        ? '<p class="empty">本轮比对没有从上一轮迁移的批注。</p>'
+        : items}
+    </div>`;
+}
+
+function remountPanelHtml(a) {
+  const cached = cmp.remountCandidates[a.id];
+  if (!cached) {
+    return '<div class="remount-panel"><p class="dim">候选片段加载中…</p></div>';
+  }
+  if (cached.sealed) {
+    return '<div class="remount-panel"><p class="dim">该比对已封存，禁止重新挂载。</p></div>';
+  }
+  const cands = cached.candidates;
+  return `
+    <div class="remount-panel" data-annotation="${a.id}">
+      <div class="remount-title">🔧 为批注 #${a.id} 选择要重新挂载的候选片段（按迁移时相似度排序）</div>
+      ${cands.length === 0
+        ? '<p class="empty">迁移时未记录到任何候选片段。</p>'
+        : `<div class="remount-cands">
+            ${cands.map((c) => `
+              <label class="remount-cand">
+                <input type="radio" name="remount-frag-${a.id}" value="${c.fragment_id}">
+                <span class="badge ft-${c.fragment_type}">${TYPE_LABEL[c.fragment_type]}</span>
+                <span class="dim">片段 #${c.fragment_ord} · ${c.side === 'old' ? '旧文本' : '新文本'}侧 · 相似度 ${(c.similarity * 100).toFixed(0)}%</span>
+                <span class="remount-text">${esc(truncate(c.side === 'old' ? c.old_text : c.new_text, 90))}</span>
+              </label>`).join('')}
+          </div>`}
+      <div class="remount-actions">
+        <input class="remount-operator" maxlength="50" placeholder="操作者姓名（必填）" value="${esc(lastAuthor.get())}">
+        <button class="btn small primary" data-action="remount-submit" data-id="${a.id}" ${cands.length === 0 ? 'disabled' : ''}>确认重挂</button>
+        <button class="btn small" data-action="remount-cancel">取消</button>
+        <span class="dim">重挂后批注状态恢复为「待处理」，并记录操作者与时间</span>
+      </div>
+    </div>`;
+}
+
+function fragmentMatchesAssigneeFilter(f) {
+  if (cmp.assigneeFilter === 'all') return true;
+  if (cmp.assigneeFilter === 'unassigned') return f.assignment_status === 'unassigned';
+  if (cmp.assigneeFilter === 'assigned') return f.assignment_status === 'assigned';
+  if (cmp.assigneeFilter === 'completed') return f.assignment_status === 'completed';
+  if (cmp.assigneeFilter.startsWith('reviewer:')) {
+    return f.assignee_id === Number(cmp.assigneeFilter.slice('reviewer:'.length));
+  }
+  return true;
+}
+
+function drawComparison() {
+  const { comparison, fragments, unanchored, stats } = cmp.data;
+  const authors = [...new Set(allAnnotations().map((a) => a.author))].sort();
+  const filtering = cmp.status !== 'all' || cmp.author !== 'all';
+
+  const shownFragments = fragments.filter((f) => {
+    if (filtering) return visibleAnnotations(f.annotations).length > 0;
+    if (!fragmentMatchesAssigneeFilter(f)) return false;
+    if (cmp.onlyAnnotated) return f.annotations.length > 0;
+    return true;
+  });
+  const shownUnanchored = visibleAnnotations(unanchored);
+
+  app.innerHTML = `
+    <nav class="crumbs">
+      <a href="#/">全部项目</a> / <a href="#/projects/${comparison.project_id}">${esc(comparison.project_name)}</a>
+      / <span class="seq-tag">v${comparison.old_seq}</span> ${esc(comparison.old_label)} → <span class="seq-tag">v${comparison.new_seq}</span> ${esc(comparison.new_label)}
+    </nav>
+    <section class="panel">
+      <div class="panel-head wrap">
+        <h2><span class="seq-tag">v${comparison.old_seq}</span> ${esc(comparison.old_label)} → <span class="seq-tag">v${comparison.new_seq}</span> ${esc(comparison.new_label)}</h2>
+        <div class="head-side">
+          ${comparison.sealed_at
+            ? '<span class="seal-badge big">🔒 已封存</span>'
+            : '<span class="draft-badge big">📝 草稿</span>'}
+          <div class="export-bar">
+            导出：
+            <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=json">JSON</a>
+            <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=csv">CSV</a>
+            <a class="btn small" href="/api/comparisons/${cmp.id}/export?format=md">Markdown</a>
+          </div>
+        </div>
+      </div>
+
+      ${comparison.new_seq !== comparison.old_seq + 1 ? `
+        <div class="baseline-banner">
+          ⟂ 本轮为<b>跨版本基线</b>比对：以历史版本 <b>v${comparison.old_seq} ${esc(comparison.old_label)}</b>
+          为基线，与新版 <b>v${comparison.new_seq} ${esc(comparison.new_label)}</b> 计算差异
+          （中间跳过 ${comparison.new_seq - comparison.old_seq - 1} 个版本）。
+          批注仅来自以该基线为新版的最近一轮比对。
+        </div>` : `
+        <div class="baseline-banner adjacent">
+          ⟂ 比对基线：上一版本 <b>v${comparison.old_seq} ${esc(comparison.old_label)}</b> → 新版 <b>v${comparison.new_seq} ${esc(comparison.new_label)}</b>
+        </div>`}
+
+      ${comparison.sealed_at ? `
+        <div class="sealed-banner">
+          🔒 本比对已于 <b>${esc(comparison.sealed_at)}</b> 由 <b>${esc(comparison.sealed_by || '（未署名）')}</b> 封存。
+          封存后禁止修改片段结论，禁止新增、编辑、改状态或删除批注。
+        </div>` : sealPanelHtml(cmp.data)}
+
+      <div class="stats">
+        <span class="chip ft-added">新增 ${stats.added}</span>
+        <span class="chip ft-removed">删除 ${stats.removed}</span>
+        <span class="chip ft-changed">修改 ${stats.changed}</span>
+        <span class="chip dc-accepted">接受 ${stats.decisions.accepted}</span>
+        <span class="chip dc-rejected">拒绝 ${stats.decisions.rejected}</span>
+        <span class="chip dc-deferred">暂缓 ${stats.decisions.deferred}</span>
+        <span class="chip dc-none${stats.decisions.undecided > 0 ? ' hot' : ''}">未作结论 ${stats.decisions.undecided}</span>
+        <span class="chip st-open${stats.annotations.open > 0 ? ' hot' : ''}">未解决批注 ${stats.annotations.open}</span>
+        <span class="chip st-pending_review${stats.annotations.pending_review > 0 ? ' hot' : ''}">待复核批注 ${stats.annotations.pending_review}</span>
+        <span class="chip st-resolved">已解决 ${stats.annotations.resolved}</span>
+      </div>
+
+      ${resolutionBarHtml(cmp.data)}
+
+      ${migrationBarHtml()}
+
+      ${assignmentPanelHtml()}
+      ${batchAssignBarHtml(fragments)}
+
+      <div class="filter-bar">
+        <label>批注状态
+          <select id="filter-status">
+            <option value="all">全部</option>
+            ${Object.entries(STATUS_LABEL).map(([v, l]) =>
+              `<option value="${v}" ${cmp.status === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </label>
+        <label>批注作者
+          <select id="filter-author">
+            <option value="all">全部</option>
+            ${authors.map((a) =>
+              `<option value="${esc(a)}" ${cmp.author === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}
+          </select>
+        </label>
+        <label>审阅分派
+          <select id="filter-assignee">
+            <option value="all" ${cmp.assigneeFilter === 'all' ? 'selected' : ''}>全部分派</option>
+            <option value="unassigned" ${cmp.assigneeFilter === 'unassigned' ? 'selected' : ''}>未分派</option>
+            <option value="assigned" ${cmp.assigneeFilter === 'assigned' ? 'selected' : ''}>已分派（进行中）</option>
+            <option value="completed" ${cmp.assigneeFilter === 'completed' ? 'selected' : ''}>已完成</option>
+            ${cmp.data.assignment.reviewers.map((r) =>
+              `<option value="reviewer:${r.id}" ${cmp.assigneeFilter === `reviewer:${r.id}` ? 'selected' : ''}>仅看 ${esc(r.name)}</option>`).join('')}
+          </select>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="filter-annotated" ${cmp.onlyAnnotated ? 'checked' : ''}>
+          只显示含批注的片段
+        </label>
+        <span class="dim">显示 ${shownFragments.length} / ${fragments.length} 个片段</span>
+      </div>
+
+      ${shownUnanchored.length > 0 ? `
+        <div class="pending-box">
+          <h3>⚠ 待复核：以下批注未能锚定到新片段（${shownUnanchored.length}）</h3>
+          ${shownUnanchored.map((a) => `
+            <div class="pending-item">
+              <div class="anchor-text">锚点文本：${esc(a.anchor_text ?? '（空）')}</div>
+              ${annHtml(a)}
+              ${!comparison.sealed_at && a.status === 'pending_review'
+                ? (cmp.remountFor === a.id
+                  ? remountPanelHtml(a)
+                  : `<button class="btn small" data-action="remount-open" data-id="${a.id}">🔧 选择候选片段重新挂载</button>`)
+                : ''}
+            </div>`).join('')}
+        </div>` : ''}
+
+      ${shownFragments.length === 0
+        ? '<p class="empty">没有符合筛选条件的差异片段。</p>'
+        : shownFragments.map(fragHtml).join('')}
+    </section>`;
+}
+
+/* ================= 事件处理 ================= */
+
+document.addEventListener('submit', async (e) => {
+  const form = e.target;
+  try {
+    if (form.id === 'create-project-form') {
+      e.preventDefault();
+      const name = form.elements.name.value.trim();
+      const { id } = await api('POST', '/api/projects', { name });
+      location.hash = `#/projects/${id}`;
+    } else if (form.id === 'import-form') {
+      e.preventDefault();
+      const projectId = form.dataset.project;
+      const label = form.elements.label.value.trim();
+      const content = form.elements.content.value;
+      const baselineSel = form.elements.baseline_version_id;
+      const body = { label, content };
+      if (baselineSel && baselineSel.value) body.baseline_version_id = Number(baselineSel.value);
+      const r = await api('POST', `/api/projects/${projectId}/versions`, body);
+      if (r.comparisonId) {
+        const mig = r.migration;
+        let migText = '';
+        if (mig) {
+          if (mig.status === 'migrated') {
+            migText = `；批注迁移 ${mig.migrated} 条、待复核 ${mig.pending} 条`;
+          } else {
+            migText = `；批注未迁移（${mig.message || '没有以所选基线为新版的历史比对'}）`;
+          }
+        }
+        const base = r.baselineVersionId == null ? '' : '（按所选基线）';
+        toast(`比对完成${base}：${r.fragmentCount} 处差异${migText}`);
+        location.hash = `#/comparisons/${r.comparisonId}`;
+      } else {
+        toast('首个版本已存档，再导入一个版本即可比对');
+        await renderProject(projectId);
+      }
+    } else if (form.classList.contains('ann-form')) {
+      e.preventDefault();
+      const author = form.elements.author.value.trim();
+      const content = form.elements.content.value.trim();
+      lastAuthor.set(author);
+      await api('POST', `/api/fragments/${form.dataset.fragment}/annotations`, { author, content });
+      await renderComparison(cmp.id);
+      toast('批注已添加');
+    } else if (form.id === 'add-reviewer-form') {
+      e.preventDefault();
+      const name = form.elements.name.value.trim();
+      if (!name) {
+        toast('请填写审阅人姓名', true);
+        return;
+      }
+      await api('POST', `/api/comparisons/${cmp.id}/reviewers`, { name });
+      lastAuthor.set(name);
+      toast(`已登记审阅人：${name}`);
+      await renderComparison(cmp.id);
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+/** 调用认领 / 完成接口：409 冲突时刷新页面，展示服务端返回的当前负责人 */
+async function callAssignmentWithRefresh(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    await renderComparison(cmp.id);
+    throw err;
+  }
+}
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  try {
+    if (action === 'load-demo') {
+      btn.disabled = true;
+      const r = await api('POST', '/api/demo');
+      const mig = r.migration;
+      let migText = '';
+      if (mig) {
+        migText =
+          mig.status === 'migrated'
+            ? `：批注迁移 ${mig.migrated} 条、待复核 ${mig.pending} 条`
+            : '：批注未迁移';
+      }
+      toast('示例数据已载入' + migText);
+      location.hash = `#/comparisons/${r.comparisons[r.comparisons.length - 1]}`;
+    } else if (action === 'delete-project') {
+      if (!confirm('确定删除该项目及其全部版本、比对与批注？')) return;
+      await api('DELETE', `/api/projects/${btn.dataset.id}`);
+      location.hash = '#/';
+    } else if (action === 'delete-annotation') {
+      if (!confirm('确定删除这条批注？')) return;
+      await api('DELETE', `/api/annotations/${btn.dataset.id}`);
+      await renderComparison(cmp.id);
+      toast('批注已删除');
+    } else if (action === 'save-decision') {
+      const box = btn.closest('.decision-box');
+      const checked = box.querySelector('input[type=radio]:checked');
+      const fragmentId = box.dataset.fragment;
+      if (!checked) {
+        toast('请先选择「接受变更 / 拒绝变更 / 暂缓」', true);
+        return;
+      }
+      const decision = checked.value;
+      const reasonInput = box.querySelector('.decision-reason-input');
+      const reason = reasonInput ? reasonInput.value.trim() : '';
+      if (decision === 'deferred' && !reason) {
+        toast('暂缓必须填写理由', true);
+        reasonInput?.focus();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api('PATCH', `/api/fragments/${fragmentId}/decision`, {
+          decision,
+          reason: decision === 'deferred' ? reason : null,
+          decided_by: lastAuthor.get() || null,
+        });
+        toast('片段结论已保存');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'gen-resolution') {
+      btn.disabled = true;
+      try {
+        cmp.resolution = await api('GET', `/api/comparisons/${cmp.id}/resolution`);
+        drawComparison();
+        toast('决议稿已生成');
+      } catch (err) {
+        await renderComparison(cmp.id);
+        throw err;
+      }
+    } else if (action === 'close-resolution') {
+      cmp.resolution = null;
+      drawComparison();
+    } else if (action === 'toggle-migration-report') {
+      cmp.showMigrationReport = !cmp.showMigrationReport;
+      if (cmp.showMigrationReport && !cmp.migrationReport) {
+        cmp.migrationReport = await api('GET', `/api/comparisons/${cmp.id}/migration-report`);
+      }
+      drawComparison();
+    } else if (action === 'remount-open') {
+      cmp.remountFor = Number(btn.dataset.id);
+      drawComparison();
+      // 懒加载该批注的迁移候选片段
+      const data = await api('GET', `/api/annotations/${cmp.remountFor}/candidates`);
+      cmp.remountCandidates[cmp.remountFor] = data;
+      drawComparison();
+    } else if (action === 'remount-cancel') {
+      cmp.remountFor = null;
+      drawComparison();
+    } else if (action === 'remount-submit') {
+      const annId = Number(btn.dataset.id);
+      const panel = btn.closest('.remount-panel');
+      const checked = panel.querySelector('input[type=radio]:checked');
+      if (!checked) {
+        toast('请先选择一个候选片段', true);
+        return;
+      }
+      const operatorInput = panel.querySelector('.remount-operator');
+      const operator = operatorInput.value.trim();
+      if (!operator) {
+        toast('请填写操作者姓名', true);
+        operatorInput.focus();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api('POST', `/api/annotations/${annId}/remount`, {
+          fragment_id: Number(checked.value),
+          operator,
+        });
+        lastAuthor.set(operator);
+        cmp.remountFor = null;
+        delete cmp.remountCandidates[annId];
+        toast('批注已重新挂载，状态恢复为「待处理」');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'remove-reviewer') {
+      const rid = Number(btn.dataset.id);
+      const reviewer = cmp.data.assignment.reviewers.find((r) => r.id === rid);
+      if (!confirm(`确定移除审阅人「${reviewer?.name ?? ''}」？其名下进行中的分派将被回收为未分派（已完成片段不可移除）。`)) return;
+      btn.disabled = true;
+      try {
+        const lead = lastLead.get() || '项目负责人';
+        await api('DELETE', `/api/comparisons/${cmp.id}/reviewers/${rid}?operator=${encodeURIComponent(lead)}`);
+        // 若移除的是当前身份，清除身份选择
+        const me = currentReviewerObj();
+        if (me && me.id === rid) currentReviewer.clear(cmp.id);
+        toast('审阅人已移除，其进行中的分派已回收');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'claim' || action === 'complete' || action === 'reopen') {
+      const me = currentReviewerObj();
+      if (!me) {
+        toast('请先在上方选择「我的审阅人身份」', true);
+        return;
+      }
+      const fragmentId = Number(btn.dataset.id);
+      const expectedVersion = Number(btn.dataset.version);
+      btn.disabled = true;
+      try {
+        if (action === 'claim') {
+          await callAssignmentWithRefresh(() =>
+            api('POST', `/api/fragments/${fragmentId}/claim`, {
+              reviewer_id: me.id,
+              expected_version: expectedVersion,
+            }));
+          toast(btn.textContent.includes('确认') ? '已确认认领' : `已认领片段，负责人：${me.name}`);
+        } else {
+          const completed = action === 'complete';
+          await callAssignmentWithRefresh(() =>
+            api('POST', `/api/fragments/${fragmentId}/assignment-status`, {
+              reviewer_id: me.id,
+              expected_version: expectedVersion,
+              completed,
+            }));
+          toast(completed ? '片段已标记完成' : '已退回进行中');
+        }
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'batch-assign') {
+      const sel = document.getElementById('batch-reviewer');
+      if (!sel.value) {
+        toast('请选择要分派的审阅人或「回收为未分派」', true);
+        return;
+      }
+      const lead = lastLead.get();
+      const operator = lead || prompt('请填写负责人（操作人）姓名：', '项目负责人');
+      if (operator == null) return;
+      if (!operator.trim()) {
+        toast('负责人姓名必填', true);
+        return;
+      }
+      lastLead.set(operator.trim());
+
+      const selectable = cmp.data.fragments.filter(
+        (f) => f.assignment_status !== 'completed'
+      );
+      const items = selectable
+        .filter((f) => cmp.selectedFragments.has(f.id))
+        .map((f) => ({
+          fragment_id: f.id,
+          reviewer_id: sel.value === '__reclaim__' ? null : Number(sel.value),
+        }));
+      if (items.length === 0) {
+        toast('所选片段均已完成，无可分派项', true);
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const r = await api('POST', `/api/comparisons/${cmp.id}/assignments`, {
+          operator: operator.trim(),
+          items,
+        });
+        cmp.selectedFragments = new Set();
+        const skipped = r.skipped_completed?.length ?? 0;
+        toast(`分派完成：更新 ${r.updated.length} 个片段${skipped ? `，跳过已完成 ${skipped} 个` : ''}`);
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'clear-selection') {
+      cmp.selectedFragments = new Set();
+      drawComparison();
+    } else if (action === 'seal') {
+      const input = document.getElementById('seal-by');
+      const sealedBy = input.value.trim();
+      if (!sealedBy) {
+        toast('请填写封存人姓名', true);
+        input.focus();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/comparisons/${btn.dataset.id}/seal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sealed_by: sealedBy }),
+        });
+        const j = await res.json().catch(() => null);
+        if (!res.ok) {
+          if (j?.blockers?.length) {
+            toast(`封存被阻塞：${j.blockers[0].message} 等 ${j.blockers.length} 项`, true);
+          } else {
+            toast(j?.error || `封存失败（${res.status}）`, true);
+          }
+          await renderComparison(cmp.id);
+          return;
+        }
+        lastSealer.set(sealedBy);
+        toast('已封存：片段结论与批注均已锁定');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+document.addEventListener('change', async (e) => {
+  const t = e.target;
+  try {
+    if (t.classList.contains('decision-radio')) {
+      const box = t.closest('.decision-box');
+      const detail = box.querySelector('.decision-detail');
+      detail.hidden = t.value !== 'deferred';
+      box.querySelectorAll('.decision-opt').forEach((el) => {
+        el.classList.toggle('picked', el.querySelector('input').checked);
+      });
+    } else if (t.classList.contains('ann-status')) {
+      await api('PATCH', `/api/annotations/${t.dataset.id}`, { status: t.value });
+      await renderComparison(cmp.id);
+      toast('状态已更新');
+    } else if (t.id === 'filter-status') {
+      cmp.status = t.value;
+      drawComparison();
+    } else if (t.id === 'filter-author') {
+      cmp.author = t.value;
+      drawComparison();
+    } else if (t.id === 'filter-annotated') {
+      cmp.onlyAnnotated = t.checked;
+      drawComparison();
+    } else if (t.id === 'filter-assignee') {
+      cmp.assigneeFilter = t.value;
+      drawComparison();
+    } else if (t.id === 'current-reviewer') {
+      if (!t.value) {
+        currentReviewer.clear(cmp.id);
+        toast('已切换为负责人视角');
+      } else {
+        const reviewer = cmp.data.assignment.reviewers.find((r) => r.id === Number(t.value));
+        if (reviewer) {
+          currentReviewer.set(cmp.id, { id: reviewer.id, name: reviewer.name });
+          lastAuthor.set(reviewer.name);
+          toast(`当前审阅人身份：${reviewer.name}`);
+        }
+      }
+      drawComparison();
+    } else if (t.classList.contains('frag-select')) {
+      const id = Number(t.dataset.id);
+      if (t.checked) cmp.selectedFragments.add(id);
+      else cmp.selectedFragments.delete(id);
+      // 只更新批量操作条，避免重绘导致滚动跳动
+      const oldBar = document.querySelector('.batch-assign-bar');
+      const newBar = batchAssignBarHtml(cmp.data.fragments);
+      if (oldBar) oldBar.remove();
+      const panel = document.querySelector('.assignment-panel');
+      if (newBar && panel) panel.insertAdjacentHTML('afterend', newBar);
+    } else if (t.classList.contains('frag-assign')) {
+      if (!t.value) return;
+      const fragmentId = Number(t.dataset.id);
+      const lead = lastLead.get();
+      const operator = lead || prompt('请填写负责人（操作人）姓名：', '项目负责人');
+      if (operator == null) {
+        t.value = '';
+        return;
+      }
+      if (!operator.trim()) {
+        toast('负责人姓名必填', true);
+        t.value = '';
+        return;
+      }
+      lastLead.set(operator.trim());
+      const reviewerId = t.value === '__reclaim__' ? null : Number(t.value);
+      try {
+        const r = await api('POST', `/api/comparisons/${cmp.id}/assignments`, {
+          operator: operator.trim(),
+          items: [{ fragment_id: fragmentId, reviewer_id: reviewerId }],
+        });
+        const skipped = r.skipped_completed?.length ?? 0;
+        toast(skipped
+          ? '该片段已完成，分派被跳过'
+          : reviewerId == null ? '已回收为未分派' : '分派已更新');
+        await renderComparison(cmp.id);
+      } catch (err) {
+        t.value = '';
+        throw err;
+      }
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+/* ================= 路由 ================= */
+
+async function route() {
+  const hash = location.hash || '#/';
+  const mProject = hash.match(/^#\/projects\/(\d+)$/);
+  const mCompare = hash.match(/^#\/comparisons\/(\d+)$/);
+  try {
+    if (mCompare) await renderComparison(Number(mCompare[1]));
+    else if (mProject) await renderProject(Number(mProject[1]));
+    else await renderProjects();
+  } catch (err) {
+    app.innerHTML = `<section class="panel"><p class="error">${esc(err.message)}</p>
+      <p><a href="#/">返回首页</a></p></section>`;
+  }
+}
+
+window.addEventListener('hashchange', route);
+route();
