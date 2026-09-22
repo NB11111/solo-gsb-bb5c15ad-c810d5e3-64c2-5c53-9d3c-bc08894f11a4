@@ -20,6 +20,7 @@ import {
 } from './service';
 import { toCsv, toMarkdown } from './exporter';
 import { buildResolution, resolutionToMarkdown } from './resolution';
+import { buildLineage, getVersionParagraphs } from './lineage';
 import { seedDemo } from './demo';
 import {
   addReviewer,
@@ -504,6 +505,26 @@ app.get('/api/comparisons/:id/resolution', (req, res) => {
   }
   if (format !== 'json') return badRequest(res, 'format 需为 json / md');
   res.json(resolution);
+});
+
+// ---------- 条款沿革 ----------
+/** 版本段落列表：供项目详情页选择追踪起点（版本 + 段落） */
+app.get('/api/versions/:id/paragraphs', (req, res) => {
+  const data = getVersionParagraphs(db, Number(req.params.id));
+  if (!data) return notFound(res, '版本不存在');
+  res.json(data);
+});
+
+/** 条款沿革树：从该版本第 para 段出发，沿基线分支图追踪未变 / 修改 / 删除 / 新增替代 */
+app.get('/api/versions/:id/lineage', (req, res) => {
+  const para = Number(req.query.para);
+  if (!Number.isInteger(para) || para < 1) {
+    return badRequest(res, '段落序号必须为正整数');
+  }
+  const result = buildLineage(db, Number(req.params.id), para);
+  if (result.status === 'version_not_found') return notFound(res, '版本不存在');
+  if (result.status === 'paragraph_not_found') return notFound(res, '段落不存在');
+  res.json(result.lineage);
 });
 
 // ---------- 示例数据 ----------

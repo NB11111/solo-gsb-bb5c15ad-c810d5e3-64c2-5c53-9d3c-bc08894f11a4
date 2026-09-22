@@ -107,8 +107,28 @@ async function renderProjects() {
 
 /* ================= 视图：项目详情 ================= */
 
+/* 条款沿革面板状态（按项目记忆，离开项目即重置） */
+const lin = {
+  projectId: null,
+  versions: [],
+  versionId: null,   // 起点版本
+  para: 1,           // 起点段落序号（1 起）
+  paragraphs: [],    // 起点版本的段落列表
+  tree: null,        // 已查询的沿革树
+};
+
 async function renderProject(id) {
   const { project, versions, comparisons } = await api('GET', `/api/projects/${id}`);
+  if (lin.projectId !== id) {
+    lin.projectId = id;
+    lin.versionId = versions.length ? versions[0].id : null;
+    lin.para = 1;
+    lin.paragraphs = [];
+    lin.tree = null;
+  }
+  lin.versions = versions;
+  // 首次导入版本后补上默认起点版本
+  if (lin.versionId == null && versions.length) lin.versionId = versions[0].id;
   app.innerHTML = `
     <nav class="crumbs"><a href="#/">全部项目</a> / ${esc(project.name)}</nav>
     <section class="panel">
@@ -168,7 +188,132 @@ async function renderProject(id) {
               ${c.sealed_at ? `封存人 ${esc(c.sealed_by || '（未署名）')} · ${esc(c.sealed_at)}` : esc(c.created_at)}
             </div>
           </a>`).join('')}</div>`}
+
+      <h3>条款沿革</h3>
+      <div id="lineage-panel">${lineagePanelHtml()}</div>
     </section>`;
+  // 懒加载起点版本的段落列表（不阻塞项目页渲染）
+  if (lin.versionId != null && lin.paragraphs.length === 0) {
+    await loadLineageParagraphs();
+  }
+}
+
+/* ================= 条款沿革 ================= */
+
+const LINEAGE_REL_LABEL = {
+  origin: '起点',
+  unchanged: '未变',
+  modified: '修改',
+  added_replacement: '新增替代',
+  removed: '删除',
+};
+
+/** 加载起点版本的段落列表（供段落下拉选择） */
+async function loadLineageParagraphs() {
+  if (lin.versionId == null) {
+    drawLineage();
+    return;
+  }
+  try {
+    const data = await api('GET', `/api/versions/${lin.versionId}/paragraphs`);
+    if (data.version.id !== lin.versionId) return; // 异步期间用户已切换版本
+    lin.paragraphs = data.paragraphs;
+    if (lin.para > lin.paragraphs.length) lin.para = 1;
+  } catch (err) {
+    lin.paragraphs = [];
+    toast(err.message, true);
+  }
+  drawLineage();
+}
+
+/** 查询沿革树 */
+async function trackLineage() {
+  const data = await api('GET', `/api/versions/${lin.versionId}/lineage?para=${lin.para}`);
+  lin.tree = data;
+  drawLineage();
+}
+
+function drawLineage() {
+  const el = document.getElementById('lineage-panel');
+  if (!el) return; // 已离开项目页
+  el.innerHTML = lineagePanelHtml();
+}
+
+function lineagePanelHtml() {
+  const versions = lin.versions ?? [];
+  if (versions.length === 0) {
+    return '<p class="empty">导入版本后，可从任一版本的任一段落出发，追踪它在后续各分支中的沿革。</p>';
+  }
+  const verOpts = versions
+    .map((v) => `<option value="${v.id}" ${v.id === lin.versionId ? 'selected' : ''}>v${v.seq} ${esc(v.label)}</option>`)
+    .join('');
+  const paraOpts = lin.paragraphs
+    .map((p) => `<option value="${p.ord}" ${p.ord === lin.para ? 'selected' : ''}>¶${p.ord} ${esc(truncate(p.text, 36))}</option>`)
+    .join('');
+  return `
+    <div class="lineage-bar">
+      <label>起点版本
+        <select id="lineage-version">${verOpts}</select>
+      </label>
+      <label>起点段落
+        <select id="lineage-para" ${lin.paragraphs.length ? '' : 'disabled'}>
+          ${paraOpts || '<option value="">段落加载中…</option>'}
+        </select>
+      </label>
+      <button class="btn primary" data-action="lineage-track" ${lin.paragraphs.length ? '' : 'disabled'}>🔎 追踪沿革</button>
+    </div>
+    <p class="hint">沿比对基线形成的分支图，追踪所选段落在后续各分支中的<b>未变 / 修改 / 删除 / 新增替代</b>关系；
+      重复段落严格按位置区分。点击节点上的「⇱ 以此为起点」可随时切换追踪起点。</p>
+    ${lin.tree ? lineageTreeHtml(lin.tree) : ''}`;
+}
+
+function lineageTreeHtml(tree) {
+  return `
+    <div class="lineage-result">
+      <div class="stats">
+        <span class="chip lin-chip-origin">起点：v${tree.start.version_seq} ${esc(tree.start.version_label)} · ¶${tree.start.para_ord}</span>
+      </div>
+      <ul class="lin-tree">${lineageNodeHtml(tree.root)}</ul>
+    </div>`;
+}
+
+function lineageNodeHtml(node) {
+  if (node.kind === 'deleted') {
+    return `
+      <li class="lin-node">
+        <div class="lin-row">
+          <span class="badge lin-removed">${LINEAGE_REL_LABEL.removed}</span>
+          <span class="tag">v${node.version_seq}</span> ${esc(node.version_label)}
+          ${node.fragment_ord != null ? `<span class="dim">片段 #${node.fragment_ord}</span>` : ''}
+          <span class="lin-term">⛔ ${esc(node.terminal.message)}</span>
+        </div>
+      </li>`;
+  }
+  const toggle = node.children.length
+    ? '<button class="lin-toggle" data-action="lineage-toggle" title="展开 / 收起">▾</button>'
+    : '<span class="lin-toggle-placeholder"></span>';
+  const terminal = node.terminal
+    ? `<span class="lin-term ${node.terminal.reason === 'latest' ? 'latest' : ''}">${node.terminal.reason === 'latest' ? '🏁' : '⛔'} ${esc(node.terminal.message)}</span>`
+    : '';
+  const children = node.children.length
+    ? `<ul class="lin-children">${node.children.map(lineageNodeHtml).join('')}</ul>`
+    : '';
+  return `
+    <li class="lin-node">
+      <div class="lin-row">
+        ${toggle}
+        <span class="badge lin-${node.relation}">${LINEAGE_REL_LABEL[node.relation]}</span>
+        <span class="tag">v${node.version_seq}</span> ${esc(node.version_label)}
+        <span class="lin-ord">¶${node.para_ord}</span>
+        ${node.fragment_ord != null ? `<span class="dim">片段 #${node.fragment_ord}</span>` : ''}
+        ${node.relation !== 'origin'
+          ? `<button class="btn small" data-action="lineage-jump" data-version="${node.version_id}" data-para="${node.para_ord}" title="以该段落为起点重新追踪">⇱ 以此为起点</button>`
+          : ''}
+        ${terminal}
+      </div>
+      <pre class="lin-text">${esc(node.text)}</pre>
+      ${children}
+    </li>`;
 }
 
 /* ================= 视图：比对详情 ================= */
@@ -1135,6 +1280,30 @@ document.addEventListener('click', async (e) => {
     } else if (action === 'clear-selection') {
       cmp.selectedFragments = new Set();
       drawComparison();
+    } else if (action === 'lineage-track') {
+      btn.disabled = true;
+      try {
+        await trackLineage();
+      } finally {
+        btn.disabled = false;
+      }
+    } else if (action === 'lineage-toggle') {
+      const node = btn.closest('.lin-node');
+      node.classList.toggle('collapsed');
+      btn.textContent = node.classList.contains('collapsed') ? '▸' : '▾';
+    } else if (action === 'lineage-jump') {
+      // 切换起点：以所选节点的版本 + 段落重新追踪
+      btn.disabled = true;
+      try {
+        lin.versionId = Number(btn.dataset.version);
+        lin.para = Number(btn.dataset.para);
+        lin.tree = null;
+        await loadLineageParagraphs();
+        await trackLineage();
+        toast('已切换追踪起点');
+      } finally {
+        btn.disabled = false;
+      }
     } else if (action === 'seal') {
       const input = document.getElementById('seal-by');
       const sealedBy = input.value.trim();
@@ -1198,6 +1367,18 @@ document.addEventListener('change', async (e) => {
     } else if (t.id === 'filter-assignee') {
       cmp.assigneeFilter = t.value;
       drawComparison();
+    } else if (t.id === 'lineage-version') {
+      lin.versionId = Number(t.value);
+      lin.para = 1;
+      lin.tree = null;
+      lin.paragraphs = [];
+      drawLineage();
+      await loadLineageParagraphs();
+    } else if (t.id === 'lineage-para') {
+      lin.para = Number(t.value);
+      // 已展示沿革树时，切换段落立即重新追踪（切换起点）
+      if (lin.tree) await trackLineage();
+      else drawLineage();
     } else if (t.id === 'current-reviewer') {
       if (!t.value) {
         currentReviewer.clear(cmp.id);
